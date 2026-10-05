@@ -10,6 +10,8 @@ import imageio_ffmpeg
 import pytest
 from PIL import Image
 
+from sticker_bot.converter import StickerKind
+
 
 @dataclass(frozen=True)
 class StickerSample:
@@ -18,10 +20,10 @@ class StickerSample:
 
 @dataclass(frozen=True)
 class AnimatedSample(StickerSample):
-    """Анимация, в которой красный объект едет слева направо по прозрачному фону."""
+    """Анимация длиной ровно секунду: красный объект едет слева направо по прозрачному фону."""
 
-    frame_count: int  # сколько кадров должно получиться в GIF
-    duration_ms: int  # какой должна получиться длительность GIF
+    kind: StickerKind
+    fps: int
     start: tuple[int, int]  # точка внутри объекта на первом кадре
     end: tuple[int, int]  # точка внутри объекта на последнем кадре
 
@@ -38,23 +40,23 @@ def webp_sticker() -> StickerSample:
 
 @pytest.fixture(scope="session")
 def tgs_sticker() -> AnimatedSample:
-    """Анимированный стикер 60 fps, как большинство TGS: в GIF он пересэмплируется в 50 fps."""
+    """Анимированный стикер 60 fps, как большинство TGS."""
     return AnimatedSample(
         data=_make_tgs(fps=60, layers=[_moving_circle(frames=60)]),
-        frame_count=50,
-        duration_ms=1000,
+        kind=StickerKind.ANIMATED,
+        fps=60,
         start=(100, 256),
-        end=(400, 256),  # к концу анимации центр круга доезжает до x≈405
+        end=(400, 256),  # к концу анимации центр круга доезжает до x≈402..407
     )
 
 
 @pytest.fixture(scope="session")
 def tgs_sticker_30fps() -> AnimatedSample:
-    """Анимированный стикер 30 fps: частота в GIF сохраняется."""
+    """Анимированный стикер 30 fps."""
     return AnimatedSample(
         data=_make_tgs(fps=30, layers=[_moving_circle(frames=30)]),
-        frame_count=30,
-        duration_ms=1000,
+        kind=StickerKind.ANIMATED,
+        fps=30,
         start=(100, 256),
         end=(400, 256),
     )
@@ -75,23 +77,23 @@ def tgs_over_gradient() -> StickerSample:
 
 @pytest.fixture(scope="session")
 def webm_sticker(tmp_path_factory: pytest.TempPathFactory) -> AnimatedSample:
-    """Видеостикер 30 fps — максимум, который допускает Telegram: частота в GIF сохраняется."""
+    """Видеостикер 30 fps — максимум, который допускает Telegram."""
     return AnimatedSample(
         data=_make_webm(tmp_path_factory, fps=30),
-        frame_count=30,
-        duration_ms=1000,
+        kind=StickerKind.VIDEO,
+        fps=30,
         start=(42, 128),  # на первом кадре квадрат занимает x 10..74
-        end=(187, 128),  # на последнем — примерно x 155..219
+        end=(187, 128),  # на последнем — примерно x 155..221
     )
 
 
 @pytest.fixture(scope="session")
 def webm_sticker_60fps(tmp_path_factory: pytest.TempPathFactory) -> AnimatedSample:
-    """Видеостикер 60 fps: Telegram такие не выпускает, но в GIF он должен стать 50 fps."""
+    """Видеостикер 60 fps: Telegram такие не выпускает, но конвертер должен справиться."""
     return AnimatedSample(
         data=_make_webm(tmp_path_factory, fps=60),
-        frame_count=50,
-        duration_ms=1000,
+        kind=StickerKind.VIDEO,
+        fps=60,
         start=(42, 128),
         end=(187, 128),
     )
