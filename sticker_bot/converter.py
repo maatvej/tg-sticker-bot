@@ -12,7 +12,6 @@ import functools
 import gzip
 import io
 import logging
-import math
 import subprocess
 import tempfile
 import threading
@@ -26,21 +25,26 @@ from rlottie_python import LottieAnimation
 
 logger = logging.getLogger(__name__)
 
-# Задержка кадра в GIF хранится в сотых долях секунды, а задержки меньше 2/100 с
-# браузеры и мессенджеры не соблюдают — анимация начинает заметно тормозить.
-# Поэтому более высокую частоту (у TGS обычно 60 fps) снижаем прореживанием кадров.
+# Задержка кадра в GIF задаётся в сотых долях секунды, поэтому 60 fps (16,7 мс на кадр)
+# можно записать только чередованием задержек 20 и 10 мс. Но браузеры (Chrome, Firefox,
+# Safari) любую задержку до 10 мс включительно растягивают до 100 мс, и такой GIF играл бы
+# в 2,8 раза медленнее. Самая короткая задержка, которую соблюдают все, — 20 мс, то есть
+# 50 fps. Анимации чаще 50 fps (у TGS обычно 60) пересэмплируются в 50 fps, остальные не меняются.
 MAX_GIF_FPS = 50
 
 FFMPEG_TIMEOUT_SECONDS = 60
 
-# Одна палитра на всю анимацию, чтобы цвета не «мерцали» от кадра к кадру. Последний
-# цвет палитры зарезервирован под прозрачность: полупрозрачности в GIF нет, поэтому
+# Одна палитра на всю анимацию и упорядоченный дизеринг (bayer): одинаковые пиксели соседних
+# кадров кодируются одинаково, и неподвижные части стикера не мерцают. С диффузионным дизерингом
+# (по умолчанию в ffmpeg) и с палитрой на каждый кадр на реальных стикерах мерцало до 13% и до 36%
+# неподвижных пикселей соответственно. bayer_scale=5 даёт самый незаметный узор дизеринга.
+# Последний цвет палитры зарезервирован под прозрачность: полупрозрачности в GIF нет, поэтому
 # пиксели с альфой меньше 128 становятся прозрачными, остальные — непрозрачными.
 _GIF_OUTPUT_ARGS = (
     "-filter_complex",
-    "[0:v]split[a][b];"
+    f"[0:v]fps=fps='min(source_fps,{MAX_GIF_FPS})',split[a][b];"
     "[a]palettegen=reserve_transparent=1[palette];"
-    "[b][palette]paletteuse=alpha_threshold=128",
+    "[b][palette]paletteuse=dither=bayer:bayer_scale=5:alpha_threshold=128",
     "-loop", "0",
     "-f", "gif",
     "pipe:1",
@@ -74,7 +78,7 @@ def tgs_to_gif(data: bytes) -> bytes:
         raise ConversionError("TGS is not a gzip-compressed Lottie JSON") from error
 
     with tempfile.TemporaryDirectory(prefix="tg-sticker-") as tmp_dir:
-        # Кадры складываем на диск, а не в память: 3 секунды анимации 512x512 — это ~100 МБ
+        # Кадры складываем на диск, а не в память: 3 секунды анимации 512x512 при 60 fps — это ~190 МБ
         frames_path = Path(tmp_dir) / "frames.rgba"
         with _rlottie_lock:
             width, height, fps = _render_lottie(lottie_json, frames_path)
@@ -101,7 +105,7 @@ def webm_to_gif(data: bytes) -> bytes:
 
 
 def _render_lottie(lottie_json: str, frames_path: Path) -> tuple[int, int, Fraction]:
-    """Рендерит кадры анимации в файл (сырые RGBA подряд). Возвращает ширину, высоту и fps."""
+    """Рендерит все кадры анимации в файл (сырые RGBA подряд). Возвращает ширину, высоту и fps."""
     with LottieAnimation.from_data(lottie_json) as animation:
         if not animation.animation_p:
             raise ConversionError("rlottie cannot parse the animation")
@@ -113,15 +117,14 @@ def _render_lottie(lottie_json: str, frames_path: Path) -> tuple[int, int, Fract
         # rlottie считает кадр op включительно, хотя он уже за концом анимации, и на стыке
         # цикла получился бы лишний кадр. Поэтому число кадров считаем по длительности.
         frame_count = max(1, round(animation.lottie_animation_get_duration() * fps))
-        step = math.ceil(fps / MAX_GIF_FPS)
         with frames_path.open("wb") as frames:
-            for frame_num in range(0, frame_count, step):
+            for frame_num in range(frame_count):
                 buffer = animation.lottie_animation_render(frame_num=frame_num, width=width, height=height)
                 # rlottie отдаёт BGRA с premultiplied-альфой. Режим "BGRa" переводит его
                 # в обычный RGBA, иначе полупрозрачные края стикера получатся тёмными.
                 frame = Image.frombuffer("RGBA", (width, height), buffer, "raw", "BGRa", 0, 1)
                 frames.write(frame.tobytes())
-    return width, height, Fraction(fps).limit_denominator(1001) / step
+    return width, height, Fraction(fps).limit_denominator(1001)
 
 
 def _run_ffmpeg(*args: str, stdin_data: bytes | None = None) -> bytes:
