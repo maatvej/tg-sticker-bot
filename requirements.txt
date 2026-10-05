@@ -1,0 +1,7 @@
+aiogram==3.31.0
+pydantic-settings==2.15.0
+Pillow==12.3.0
+# Рендер анимированных стикеров (TGS/Lottie), библиотека rlottie уже внутри пакета
+rlottie-python==1.3.8
+# Готовый бинарник ffmpeg (с libvpx для видеостикеров), ставить ffmpeg в систему не нужно
+imageio-ffmpeg==0.6.0
