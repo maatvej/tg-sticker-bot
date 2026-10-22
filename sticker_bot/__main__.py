@@ -10,16 +10,21 @@ from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.utils.backoff import Backoff, BackoffConfig
 
 from sticker_bot.config import ENV_FILE, Settings
+from sticker_bot.flood_control import RetryAfterMiddleware, UploadStatus
 from sticker_bot.handlers import router
 
 logger = logging.getLogger(__name__)
 
 
 async def run_bot(settings: Settings) -> None:
-    dispatcher = Dispatcher(conversion_limiter=asyncio.Semaphore(settings.max_concurrent_conversions))
+    dispatcher = Dispatcher(
+        conversion_limiter=asyncio.Semaphore(settings.max_concurrent_conversions),
+        upload_status=UploadStatus(),
+    )
     dispatcher.include_router(router)
     # Сессия закроется, даже если бота остановят ещё до старта polling
     async with Bot(token=settings.bot_token.get_secret_value()) as bot:
+        bot.session.middleware(RetryAfterMiddleware())
         await wait_for_telegram(bot)
         await dispatcher.start_polling(bot)
 

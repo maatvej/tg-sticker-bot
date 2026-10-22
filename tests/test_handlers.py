@@ -1,6 +1,7 @@
 """Сквозная проверка бота: апдейт от Telegram -> ответ бота, без обращений к сети."""
 
 import asyncio
+import gc
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Any
@@ -8,10 +9,12 @@ from typing import Any
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import AnswerCallbackQuery, GetFile, SendChatAction, SendDocument, SendMessage, TelegramMethod
 from aiogram.types import BufferedInputFile, CallbackQuery, Chat, File, Message, Sticker, Update, User
 
 from sticker_bot.converter import OutputFormat
+from sticker_bot.flood_control import RetryAfterMiddleware, UploadStatus
 from sticker_bot.handlers import ERROR_TEXT, HELP_TEXT, SOURCE_LOST_TEXT, FormatChoice, router
 
 CHAT = Chat(id=1, type="private")
@@ -21,15 +24,22 @@ STICKER_FILE_ID = "sticker-file-id"
 
 
 class FakeSession(BaseSession):
-    """Подменяет HTTP-запросы к Telegram: отдаёт файл стикера и запоминает вызванные методы."""
+    """Подменяет HTTP-запросы к Telegram: отдаёт файл стикера и запоминает вызванные методы.
 
-    def __init__(self, sticker_data: bytes) -> None:
+    floods — сколько раз ответить на метод ошибкой 429 (flood control), прежде чем выполнить его.
+    """
+
+    def __init__(self, sticker_data: bytes, floods: dict[type[TelegramMethod[Any]], int] | None = None) -> None:
         super().__init__()
         self.sticker_data = sticker_data
+        self.floods = dict(floods or {})
         self.requests: list[TelegramMethod[Any]] = []
 
     async def make_request(self, bot: Bot, method: TelegramMethod[Any], timeout: int | None = None) -> Any:
         self.requests.append(method)
+        if self.floods.get(type(method)):
+            self.floods[type(method)] -= 1
+            raise TelegramRetryAfter(method=method, message="Too Many Requests: retry after 0", retry_after=0)
         if isinstance(method, GetFile):
             return File(file_id=method.file_id, file_unique_id="file", file_path=f"stickers/{method.file_id}")
         if isinstance(method, (SendChatAction, AnswerCallbackQuery)):
@@ -61,22 +71,29 @@ def dispatcher() -> Dispatcher:
     return dispatcher
 
 
-def send(dispatcher: Dispatcher, update: Update | Message, sticker_data: bytes = b"") -> list[TelegramMethod[Any]]:
+def send(
+    dispatcher: Dispatcher, update: Update | Message, sticker_data: bytes = b"", session: FakeSession | None = None
+) -> list[TelegramMethod[Any]]:
     """Прогоняет апдейт через бота и возвращает ответы бота (без скачивания и статуса «отправляет файл»)."""
-    session = FakeSession(sticker_data)
+    session = session or FakeSession(sticker_data)
     if isinstance(update, Message):
         update = Update(update_id=1, message=update)
 
     async def feed() -> None:
         bot = Bot(token="123456:TEST", session=session)
-        await dispatcher.feed_update(bot, update, conversion_limiter=asyncio.Semaphore(1))
+        await dispatcher.feed_update(bot, update, **dependencies())
 
     asyncio.run(feed())
     return [request for request in session.requests if not isinstance(request, (GetFile, SendChatAction))]
 
 
-def make_message(**fields: Any) -> Message:
-    return Message(message_id=1, date=datetime.now(), chat=CHAT, from_user=USER, **fields)
+def dependencies() -> dict[str, Any]:
+    """То, что __main__ передаёт обработчикам через диспетчер."""
+    return {"conversion_limiter": asyncio.Semaphore(2), "upload_status": UploadStatus()}
+
+
+def make_message(message_id: int = 1, **fields: Any) -> Message:
+    return Message(message_id=message_id, date=datetime.now(), chat=CHAT, from_user=USER, **fields)
 
 
 def make_sticker(*, is_animated: bool = False, is_video: bool = False) -> Sticker:
@@ -159,6 +176,41 @@ def test_format_button_without_original_sticker_shows_alert(dispatcher):
     assert isinstance(answer, AnswerCallbackQuery)
     assert answer.show_alert
     assert answer.text == SOURCE_LOST_TEXT
+
+
+def test_burst_of_stickers_shows_one_upload_status_per_chat(dispatcher, webp_sticker):
+    """Пачка стикеров разом, а Telegram отвечает на статус «отправляет файл» ошибкой 429.
+
+    Статус должен быть один на чат, а не на каждый стикер, его ошибки не должны всплывать
+    как «Task exception was never retrieved», и все файлы должны дойти.
+    """
+    session = FakeSession(webp_sticker.data, floods={SendChatAction: 1000})
+    updates = [Update(update_id=i, message=make_message(i, sticker=make_sticker())) for i in range(1, 11)]
+    unretrieved_errors: list[dict[str, Any]] = []
+
+    async def feed() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda loop, context: unretrieved_errors.append(context))
+        bot = Bot(token="123456:TEST", session=session)
+        shared = dependencies()
+        await asyncio.gather(*(dispatcher.feed_update(bot, update, **shared) for update in updates))
+        gc.collect()  # о непрочитанном исключении задачи asyncio сообщает, когда задачу удаляет сборщик мусора
+
+    asyncio.run(feed())
+
+    assert sum(isinstance(request, SendChatAction) for request in session.requests) == 1
+    assert sum(isinstance(request, SendDocument) for request in session.requests) == 10
+    assert unretrieved_errors == []
+
+
+def test_file_is_sent_again_after_flood_control(dispatcher, webp_sticker):
+    session = FakeSession(webp_sticker.data, floods={SendDocument: 1})
+    session.middleware(RetryAfterMiddleware())
+
+    replies = send(dispatcher, make_message(sticker=make_sticker()), session=session)
+
+    # Первая попытка получила 429, вторая прошла
+    assert len(replies) == 2
+    assert all(isinstance(reply, SendDocument) for reply in replies)
 
 
 def test_broken_sticker_gets_error_message(dispatcher):

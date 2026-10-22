@@ -8,10 +8,10 @@ from aiogram.enums import ChatType
 from aiogram.filters import CommandStart
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message, Sticker
-from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from sticker_bot.converter import OUTPUT_FORMATS, OutputFormat, StickerKind, convert_sticker
+from sticker_bot.flood_control import UploadStatus
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +46,20 @@ async def handle_start(message: Message) -> None:
 
 
 @router.message(F.sticker)
-async def handle_sticker(message: Message, bot: Bot, conversion_limiter: asyncio.Semaphore) -> None:
+async def handle_sticker(
+    message: Message, bot: Bot, conversion_limiter: asyncio.Semaphore, upload_status: UploadStatus
+) -> None:
     kind = _sticker_kind(message.sticker)
-    await _reply_with_converted(message, OUTPUT_FORMATS[kind][0], bot, conversion_limiter)
+    await _reply_with_converted(message, OUTPUT_FORMATS[kind][0], bot, conversion_limiter, upload_status)
 
 
 @router.callback_query(FormatChoice.filter())
 async def handle_format_choice(
-    callback: CallbackQuery, callback_data: FormatChoice, bot: Bot, conversion_limiter: asyncio.Semaphore
+    callback: CallbackQuery,
+    callback_data: FormatChoice,
+    bot: Bot,
+    conversion_limiter: asyncio.Semaphore,
+    upload_status: UploadStatus,
 ) -> None:
     # Кнопки висят под файлом, который бот прислал ответом на сообщение со стикером
     source = callback.message.reply_to_message if isinstance(callback.message, Message) else None
@@ -61,7 +67,7 @@ async def handle_format_choice(
         await callback.answer(SOURCE_LOST_TEXT, show_alert=True)
         return
     await callback.answer(f"Конвертирую в {FORMAT_LABELS[callback_data.output]}…")
-    await _reply_with_converted(source, callback_data.output, bot, conversion_limiter)
+    await _reply_with_converted(source, callback_data.output, bot, conversion_limiter, upload_status)
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
@@ -70,12 +76,16 @@ async def handle_other(message: Message) -> None:
 
 
 async def _reply_with_converted(
-    message: Message, output: OutputFormat, bot: Bot, conversion_limiter: asyncio.Semaphore
+    message: Message,
+    output: OutputFormat,
+    bot: Bot,
+    conversion_limiter: asyncio.Semaphore,
+    upload_status: UploadStatus,
 ) -> None:
     """Конвертирует стикер из сообщения и присылает файл ответом на это сообщение."""
     sticker = message.sticker
     kind = _sticker_kind(sticker)
-    async with ChatActionSender.upload_document(chat_id=message.chat.id, bot=bot):
+    async with upload_status.shown(bot, message.chat.id):
         try:
             source = await bot.download(sticker)
             async with conversion_limiter:
