@@ -197,34 +197,48 @@ def _render_tgs(data: bytes, tmp_dir: Path) -> _Frames:
     return _Frames(path, width, height, Fraction(fps).limit_denominator(1001))
 
 
+# Чем декодировать видеостикер: варианты пробуются по порядку, пока какой-нибудь не сработает
+_WEBM_DECODERS: tuple[tuple[str, ...], ...] = (
+    # Встроенный в ffmpeg декодер VP9 отбрасывает альфа-канал (фон стал бы чёрным), поэтому libvpx-vp9
+    ("-c:v", "libvpx-vp9"),
+    # Некоторые стикеры (например, сделанные в @fStikBot) помечены несуществующим цветовым
+    # пространством, и ffmpeg 7.1 их не декодирует: «Invalid color space». Тогда метка сбрасывается
+    # на «неизвестно», и цвета считаются по BT.601, как у стикеров без метки. Сбрасывать её всегда
+    # нельзя: у стикеров, честно помеченных как BT.709, сместились бы цвета.
+    ("-c:v", "libvpx-vp9", "-bsf:v", "vp9_metadata=color_space=unknown"),
+    # Например, ролик закодирован в VP8, а не в VP9: пусть ffmpeg сам выберет декодер
+    (),
+)
+
+
 def _decode_webm(data: bytes, tmp_dir: Path) -> _Frames:
     """Видеостикер: декодирует все кадры в файл."""
     source = tmp_dir / "source.webm"
     source.write_bytes(data)
-    # Встроенный в ffmpeg декодер VP9 отбрасывает альфа-канал (фон стал бы чёрным),
-    # поэтому явно выбираем декодер libvpx-vp9. Ошибки ffmpeg imageio-ffmpeg сообщает
-    # через OSError (не прочитался заголовок) и RuntimeError (оборвался поток кадров).
-    try:
-        return _decode_video(source, tmp_dir, decoder=("-c:v", "libvpx-vp9"))
-    except (OSError, RuntimeError) as error:
-        # Например, ролик закодирован в VP8, а не в VP9: пусть ffmpeg сам выберет декодер
-        logger.warning("libvpx-vp9 failed, retrying with the default decoder: %s", error)
-    try:
-        return _decode_video(source, tmp_dir, decoder=())
-    except (OSError, RuntimeError) as error:
-        raise ConversionError("Cannot decode the video sticker") from error
+    errors: list[Exception] = []
+    for decoder in _WEBM_DECODERS:
+        try:
+            return _decode_video(source, tmp_dir, decoder)
+        # Ошибки ffmpeg imageio-ffmpeg сообщает через OSError (не прочитался заголовок)
+        # и RuntimeError (оборвался поток кадров)
+        except (OSError, RuntimeError, ConversionError) as error:
+            logger.debug("Decoding the video sticker with %s failed: %s", decoder or "default options", error)
+            errors.append(error)
+    raise ConversionError("Cannot decode the video sticker") from errors[0]
 
 
 def _decode_video(source: Path, tmp_dir: Path, decoder: tuple[str, ...]) -> _Frames:
     path = tmp_dir / "frames.rgba"
-    reader = imageio_ffmpeg.read_frames(str(source), pix_fmt="rgba", bits_per_pixel=32, input_params=list(decoder))
+    reader = imageio_ffmpeg.read_frames(
+        str(source), pix_fmt="rgba", bits_per_pixel=32, input_params=["-hide_banner", *decoder]
+    )
     with contextlib.closing(reader), path.open("wb") as frames:
         meta = next(reader)
         for frame in reader:
             frames.write(frame)
     width, height = meta["size"]
     if meta["fps"] <= 0 or not path.stat().st_size:
-        raise ConversionError("Cannot decode the video sticker")
+        raise ConversionError("ffmpeg decoded no frames")
     return _Frames(path, width, height, Fraction(meta["fps"]).limit_denominator(1001))
 
 

@@ -18,7 +18,13 @@ from sticker_bot.converter import (
     convert_sticker,
 )
 
-ANIMATED_SAMPLES = ["tgs_sticker", "tgs_sticker_30fps", "webm_sticker", "webm_sticker_60fps"]
+ANIMATED_SAMPLES = [
+    "tgs_sticker",
+    "tgs_sticker_30fps",
+    "webm_sticker",
+    "webm_sticker_60fps",
+    "webm_sticker_reserved_colorspace",
+]
 ANIMATED_FORMATS = [OutputFormat.GIF, OutputFormat.APNG, OutputFormat.WEBP, OutputFormat.WEBM]
 PILLOW_FORMAT_NAMES = {OutputFormat.GIF: "GIF", OutputFormat.APNG: "PNG", OutputFormat.WEBP: "WEBP"}
 
@@ -40,8 +46,15 @@ def decode_webm(data: bytes) -> tuple[list[Image.Image], float]:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "video.webm"
         path.write_bytes(data)
-        # Декодер libvpx-vp9 — единственный в ffmpeg, который читает альфа-канал VP9
-        reader = imageio_ffmpeg.read_frames(str(path), pix_fmt="rgba", bits_per_pixel=32, input_params=["-c:v", "libvpx-vp9"])
+        # Декодер libvpx-vp9 — единственный в ffmpeg, который читает альфа-канал VP9. Цветовая метка
+        # сбрасывается, потому что видеостикер с меткой reserved конвертер отдаёт в WebM как есть,
+        # а ffmpeg 7.1 такие файлы не декодирует; на остальные тестовые ролики это не влияет.
+        reader = imageio_ffmpeg.read_frames(
+            str(path),
+            pix_fmt="rgba",
+            bits_per_pixel=32,
+            input_params=["-c:v", "libvpx-vp9", "-bsf:v", "vp9_metadata=color_space=unknown"],
+        )
         meta = next(reader)
         frames = [Image.frombytes("RGBA", meta["size"], frame) for frame in reader]
     return frames, meta["duration"] * 1000
@@ -149,6 +162,22 @@ def test_webp_background_is_transparent(tgs_sticker):
     webp = convert_sticker(tgs_sticker.data, StickerKind.ANIMATED, OutputFormat.WEBP)
     with Image.open(io.BytesIO(webp)) as image:
         assert image.info["background"] == (0, 0, 0, 0)
+
+
+def test_colorspace_tag_is_reset_only_when_invalid(webm_sticker, retag_colorspace):
+    """Метку reserved конвертер сбрасывает (цвета как у ролика без метки), а честную BT.709 — нет."""
+
+    def center_color(webm: bytes) -> tuple[int, ...]:
+        frames, _ = decode(convert_sticker(webm, StickerKind.VIDEO, OutputFormat.APNG), OutputFormat.APNG)
+        return frames[0].getpixel(webm_sticker.start)
+
+    untagged = center_color(webm_sticker.data)
+    reserved = center_color(retag_colorspace(webm_sticker.data, "6"))
+    bt709 = center_color(retag_colorspace(webm_sticker.data, "bt709"))
+
+    assert reserved == untagged
+    # Красный, закодированный по BT.601 и прочитанный как BT.709, заметно уходит в оранжевый
+    assert bt709[1] - untagged[1] > 10
 
 
 def test_video_sticker_to_webm_returns_original(webm_sticker):

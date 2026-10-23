@@ -4,6 +4,7 @@ import gzip
 import io
 import json
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import imageio_ffmpeg
@@ -94,6 +95,34 @@ def webm_sticker_60fps(tmp_path_factory: pytest.TempPathFactory) -> AnimatedSamp
         data=_make_webm(tmp_path_factory, fps=60),
         kind=StickerKind.VIDEO,
         fps=60,
+        start=(42, 128),
+        end=(187, 128),
+    )
+
+
+@pytest.fixture(scope="session")
+def retag_colorspace(tmp_path_factory: pytest.TempPathFactory) -> Callable[[bytes, str], bytes]:
+    """Переписывает цветовую метку в потоке VP9 без перекодирования, как это делают некоторые боты."""
+
+    def retag(webm: bytes, color_space: str) -> bytes:
+        folder = tmp_path_factory.mktemp("retagged")
+        source, result = folder / "source.webm", folder / "result.webm"
+        source.write_bytes(webm)
+        _ffmpeg("-i", str(source), "-c", "copy", "-bsf:v", f"vp9_metadata=color_space={color_space}", str(result))
+        return result.read_bytes()
+
+    return retag
+
+
+@pytest.fixture(scope="session")
+def webm_sticker_reserved_colorspace(
+    tmp_path_factory: pytest.TempPathFactory, retag_colorspace: Callable[[bytes, str], bytes]
+) -> AnimatedSample:
+    """Видеостикер 25 fps с несуществующим цветовым пространством (reserved), как у стикеров из @fStikBot."""
+    return AnimatedSample(
+        data=retag_colorspace(_make_webm(tmp_path_factory, fps=25), "6"),  # 6 — reserved
+        kind=StickerKind.VIDEO,
+        fps=25,
         start=(42, 128),
         end=(187, 128),
     )
