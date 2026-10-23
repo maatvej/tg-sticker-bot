@@ -26,6 +26,14 @@ HELP_TEXT = (
 )
 ERROR_TEXT = "Не получилось сконвертировать этот стикер 😔 Попробуй другой."
 SOURCE_LOST_TEXT = "Не нашёл исходный стикер — пришли его ещё раз."
+TOO_LARGE_TEXT = (
+    "В формате {format} файл получился слишком большим ({size} МБ): Telegram не даёт ботам "
+    "отправлять файлы больше 50 МБ. Выбери другой формат:"
+)
+
+# Больше Telegram не даёт ботам отправлять файлы. В документации Bot API сказано «up to 50 MB»;
+# понимаем это в меньшую сторону, как 50 000 000 байт, чтобы отправка не упала на границе.
+MAX_UPLOAD_BYTES = 50_000_000
 
 FORMAT_LABELS = {
     OutputFormat.PNG: "PNG",
@@ -98,11 +106,19 @@ async def _reply_with_converted(
             await message.reply(ERROR_TEXT)
             return
 
+        other_formats = _other_formats_keyboard(kind, output)
+        if len(result) > MAX_UPLOAD_BYTES:
+            logger.info("Sticker %s in %s is too large to send: %d bytes", sticker.file_unique_id, output, len(result))
+            size = f"{len(result) / 1_000_000:.1f}".replace(".", ",")
+            # Ответ на сообщение со стикером: кнопки под ним найдут исходный стикер так же, как под файлом
+            await message.reply(TOO_LARGE_TEXT.format(format=FORMAT_LABELS[output], size=size), reply_markup=other_formats)
+            return
+
         await message.reply_document(
             BufferedInputFile(result, filename=f"sticker_{sticker.file_unique_id}.{output.value}"),
             # Без этого Telegram распознает GIF как анимацию и перекодирует его в MP4
             disable_content_type_detection=True,
-            reply_markup=_other_formats_keyboard(kind, output),
+            reply_markup=other_formats,
         )
 
 

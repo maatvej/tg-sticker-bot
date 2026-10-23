@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import AnswerCallbackQuery, GetFile, SendChatAction, SendDocument, SendMessage, TelegramMethod
 from aiogram.types import BufferedInputFile, CallbackQuery, Chat, File, Message, Sticker, Update, User
 
+from sticker_bot import handlers
 from sticker_bot.converter import OutputFormat
 from sticker_bot.flood_control import RetryAfterMiddleware, UploadStatus
 from sticker_bot.handlers import ERROR_TEXT, HELP_TEXT, SOURCE_LOST_TEXT, FormatChoice, router
@@ -119,7 +120,7 @@ def press_button(sticker_message: Message | None, output: OutputFormat) -> Updat
     return Update(update_id=2, callback_query=callback)
 
 
-def button_texts(reply: SendDocument) -> list[str]:
+def button_texts(reply: SendDocument | SendMessage) -> list[str]:
     return [button.text for row in reply.reply_markup.inline_keyboard for button in row]
 
 
@@ -211,6 +212,19 @@ def test_file_is_sent_again_after_flood_control(dispatcher, webp_sticker):
     # Первая попытка получила 429, вторая прошла
     assert len(replies) == 2
     assert all(isinstance(reply, SendDocument) for reply in replies)
+
+
+def test_too_large_file_is_replaced_by_choice_of_other_formats(dispatcher, tgs_sticker, monkeypatch):
+    monkeypatch.setattr(handlers, "MAX_UPLOAD_BYTES", 1000)  # любой GIF больше
+    message = make_message(sticker=make_sticker(is_animated=True))
+
+    [reply] = send(dispatcher, message, tgs_sticker.data)
+
+    assert isinstance(reply, SendMessage)
+    assert reply.text.startswith("В формате GIF файл получился слишком большим")
+    # Ответ на сообщение со стикером: по кнопкам бот найдёт исходный стикер
+    assert reply.reply_parameters.message_id == message.message_id
+    assert button_texts(reply) == ["APNG", "WebP", "WebM"]
 
 
 def test_broken_sticker_gets_error_message(dispatcher):
